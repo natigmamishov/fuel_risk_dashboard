@@ -630,6 +630,7 @@ if "actual_lph" in df.columns and "normal_lph" in df.columns:
             "project",
             "point",
             "fuel_datetime",
+            "next_fuel_datetime",
             "volume",
             "work_hours_until_next_fuel",
             "actual_lph",
