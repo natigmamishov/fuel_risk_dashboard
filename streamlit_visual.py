@@ -1,108 +1,293 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import numpy as np
 
 st.set_page_config(
     page_title="Fuel Risk Dashboard",
     layout="wide"
 )
 
-st.title("Fuel, GPS və DUT Risk Dashboard")
+# =========================
+# STYLE
+# =========================
 
+st.markdown("""
+<style>
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 2rem;
+}
+.main-title {
+    font-size: 42px;
+    font-weight: 800;
+    color: #1f2937;
+    margin-bottom: 0px;
+}
+.subtitle {
+    font-size: 16px;
+    color: #6b7280;
+    margin-bottom: 25px;
+}
+.section-card {
+    background-color: #f8fafc;
+    padding: 18px 22px;
+    border-radius: 18px;
+    border: 1px solid #e5e7eb;
+    margin-bottom: 20px;
+}
+.risk-box {
+    background-color: #fff7ed;
+    border-left: 6px solid #f97316;
+    padding: 16px 20px;
+    border-radius: 12px;
+    margin-bottom: 18px;
+}
+.ai-box {
+    background-color: #eef2ff;
+    border-left: 6px solid #4f46e5;
+    padding: 16px 20px;
+    border-radius: 12px;
+    margin-bottom: 18px;
+    white-space: pre-line;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="main-title">Fuel, GPS və DUT Risk Dashboard</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="subtitle">Yanacaq sərfiyyatı, GPS motosaat/km, DUT sızma və risk analitikası</div>',
+    unsafe_allow_html=True
+)
+
+# =========================
+# DATA LOAD
+# =========================
 
 @st.cache_data
 def load_excel(file_name):
     return pd.read_excel(file_name)
 
-
 df_overuse_with_leak = load_excel("overuse_with_leak.xlsx")
 df_decrease_10plus = load_excel("decrease_10_plus.xlsx")
 df_analysis = load_excel("atlas_gps_analysis.xlsx")
 
+# =========================
+# HELPERS
+# =========================
 
-def generate_data_summary(df, dataset_choice, plate_col=None):
+def get_date_col(df):
+    if "fuel_datetime" in df.columns:
+        return "fuel_datetime"
+    if "datetime" in df.columns:
+        return "datetime"
+    if "first_leak_datetime" in df.columns:
+        return "first_leak_datetime"
+    return None
+
+
+def get_plate_col(df):
+    if "plate" in df.columns:
+        return "plate"
+    if "plate_clean" in df.columns:
+        return "plate_clean"
+    if "Grouping" in df.columns:
+        return "Grouping"
+    return None
+
+
+def prepare_dates(df):
+    for col in [
+        "fuel_datetime",
+        "next_fuel_datetime",
+        "first_leak_datetime",
+        "last_leak_datetime",
+        "datetime"
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+
+def get_overuse_mask(data):
+    mask = pd.Series(False, index=data.index)
+
+    if "motohour_analysis" in data.columns:
+        mask = mask | data["motohour_analysis"].astype(str).str.contains(
+            "yüksək|limitindən yüksək|limitdən yüksək", case=False, na=False
+        )
+
+    if "km_analysis" in data.columns:
+        mask = mask | data["km_analysis"].astype(str).str.contains(
+            "yüksək|limitindən yüksək|limitdən yüksək", case=False, na=False
+        )
+
+    return mask
+
+
+def build_attention_table(df, plate_col):
+    if not plate_col or df.empty:
+        return pd.DataFrame()
+
+    temp = df.copy()
+
+    temp["risk_score"] = 0
+
+    if "total_leak_liters" in temp.columns:
+        temp["risk_score"] += temp["total_leak_liters"].fillna(0) * 1.0
+
+    if "leak_event_count" in temp.columns:
+        temp["risk_score"] += temp["leak_event_count"].fillna(0) * 10
+
+    if "actual_l_100km" in temp.columns:
+        temp["risk_score"] += temp["actual_l_100km"].fillna(0) * 0.5
+
+    if "actual_lph" in temp.columns:
+        temp["risk_score"] += temp["actual_lph"].fillna(0) * 2
+
+    if "motohour_analysis" in temp.columns or "km_analysis" in temp.columns:
+        temp["overuse_flag"] = get_overuse_mask(temp).astype(int)
+        temp["risk_score"] += temp["overuse_flag"] * 50
+
+    agg_dict = {
+        "risk_score": ("risk_score", "sum"),
+        "record_count": (plate_col, "count")
+    }
+
+    if "total_leak_liters" in temp.columns:
+        agg_dict["total_leak_liters"] = ("total_leak_liters", "sum")
+
+    if "leak_event_count" in temp.columns:
+        agg_dict["leak_event_count"] = ("leak_event_count", "sum")
+
+    if "volume" in temp.columns:
+        agg_dict["total_volume"] = ("volume", "sum")
+
+    if "actual_l_100km" in temp.columns:
+        agg_dict["max_l_100km"] = ("actual_l_100km", "max")
+
+    if "actual_lph" in temp.columns:
+        agg_dict["max_lph"] = ("actual_lph", "max")
+
+    if "equipment_type" in temp.columns:
+        agg_dict["equipment_type"] = ("equipment_type", "first")
+
+    if "project" in temp.columns:
+        agg_dict["project"] = ("project", "first")
+
+    result = (
+        temp.groupby(plate_col, as_index=False)
+        .agg(**agg_dict)
+        .sort_values("risk_score", ascending=False)
+        .head(15)
+    )
+
+    return result
+
+
+def generate_ai_summary(df, dataset_choice, plate_col):
     lines = []
 
-    lines.append(f"Seçilmiş dataset: {dataset_choice}")
-    lines.append(f"Ümumi sətir sayı: {len(df)}")
+    lines.append("📌 Ümumi baxış")
+    lines.append(f"- Seçilmiş dataset: {dataset_choice}")
+    lines.append(f"- Sətir sayı: {len(df)}")
 
-    if plate_col and plate_col in df.columns:
-        lines.append(f"Unikal maşın sayı: {df[plate_col].nunique()}")
+    if plate_col:
+        lines.append(f"- Unikal maşın sayı: {df[plate_col].nunique()}")
 
     if "volume" in df.columns:
-        lines.append(f"Ümumi yanacaq miqdarı: {df['volume'].sum():,.2f} litr")
+        lines.append(f"- Ümumi yanacaq həcmi: {df['volume'].sum():,.2f} litr")
 
     if "total_leak_liters" in df.columns:
-        lines.append(f"Ümumi sızma miqdarı: {df['total_leak_liters'].sum():,.2f} litr")
+        lines.append(f"- Ümumi sızma/azalma həcmi: {df['total_leak_liters'].sum():,.2f} litr")
 
-    if "leak_event_count" in df.columns:
-        lines.append(f"Ümumi sızma hadisəsi: {df['leak_event_count'].sum():,.0f}")
+    elif "delta" in df.columns:
+        lines.append(f"- Ümumi DUT azalma həcmi: {df['delta'].abs().sum():,.2f} litr")
 
-    if "actual_l_100km" in df.columns and plate_col:
-        temp = df.dropna(subset=["actual_l_100km"])
-        if not temp.empty:
-            max_row = temp.sort_values("actual_l_100km", ascending=False).iloc[0]
+    lines.append("")
+    lines.append("⚠️ Risk analizi")
+
+    if plate_col:
+        attention = build_attention_table(df, plate_col)
+
+        if not attention.empty:
+            top = attention.iloc[0]
             lines.append(
-                f"Ən yüksək km sərfi: {max_row[plate_col]} - "
-                f"{max_row['actual_l_100km']:.2f} L/100km"
+                f"- Ən çox diqqət tələb edən maşın: {top[plate_col]} "
+                f"(risk score: {top['risk_score']:.1f})"
             )
 
-    if "actual_lph" in df.columns and plate_col:
-        temp = df.dropna(subset=["actual_lph"])
-        if not temp.empty:
-            max_row = temp.sort_values("actual_lph", ascending=False).iloc[0]
-            lines.append(
-                f"Ən yüksək motosaat sərfi: {max_row[plate_col]} - "
-                f"{max_row['actual_lph']:.2f} L/saat"
+            if "total_leak_liters" in attention.columns:
+                lines.append(
+                    f"- Bu maşın üzrə sızma/azalma həcmi: "
+                    f"{top.get('total_leak_liters', 0):,.2f} litr"
+                )
+
+    if "motohour_analysis" in df.columns or "km_analysis" in df.columns:
+        overuse_count = int(get_overuse_mask(df).sum())
+        lines.append(f"- Normadan artıq sərfiyyat görünən interval sayı: {overuse_count}")
+
+    if "total_leak_liters" in df.columns and "leak_event_count" in df.columns:
+        high_leak = df[df["total_leak_liters"] >= df["total_leak_liters"].quantile(0.75)]
+        lines.append(f"- Yüksək sızma həcmi olan interval sayı: {len(high_leak)}")
+
+    lines.append("")
+    lines.append("📈 Trend müşahidəsi")
+
+    date_col = get_date_col(df)
+    leak_date_col = "first_leak_datetime" if "first_leak_datetime" in df.columns else date_col
+
+    if leak_date_col and leak_date_col in df.columns:
+        temp = df.copy()
+        temp[leak_date_col] = pd.to_datetime(temp[leak_date_col], errors="coerce")
+        temp = temp.dropna(subset=[leak_date_col])
+
+        if "total_leak_liters" in temp.columns and not temp.empty:
+            daily = (
+                temp.assign(date=temp[leak_date_col].dt.date)
+                .groupby("date")["total_leak_liters"]
+                .sum()
+                .sort_index()
             )
 
-    if "total_leak_liters" in df.columns and plate_col:
-        top_leak = (
-            df.groupby(plate_col)["total_leak_liters"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(5)
-        )
+            if len(daily) >= 2:
+                first_val = daily.iloc[0]
+                last_val = daily.iloc[-1]
 
-        lines.append("Ən çox sızma görünən maşınlar:")
-        for plate, val in top_leak.items():
-            lines.append(f"- {plate}: {val:.2f} litr")
+                if last_val > first_val:
+                    trend = "artan"
+                elif last_val < first_val:
+                    trend = "azalan"
+                else:
+                    trend = "stabil"
 
-    if "project" in df.columns and "total_leak_liters" in df.columns:
-        top_project = (
-            df.groupby("project")["total_leak_liters"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(1)
-        )
+                lines.append(f"- Seçilmiş aralıqda sızma trendi: {trend}")
+                lines.append(f"- Maksimum gündəlik sızma: {daily.max():,.2f} litr")
 
-        if not top_project.empty:
-            lines.append(
-                f"Ən yüksək sızma miqdarı olan layihə: "
-                f"{top_project.index[0]} ({top_project.iloc[0]:.2f} litr)"
+        elif "delta" in temp.columns and not temp.empty:
+            daily = (
+                temp.assign(date=temp[leak_date_col].dt.date)
+                .groupby("date")["delta"]
+                .apply(lambda x: x.abs().sum())
+                .sort_index()
             )
 
-    if "project" in df.columns and plate_col:
-        top_project_vehicle = (
-            df.groupby("project")[plate_col]
-            .nunique()
-            .sort_values(ascending=False)
-            .head(1)
-        )
+            if len(daily) >= 2:
+                lines.append(f"- Maksimum gündəlik DUT azalma: {daily.max():,.2f} litr")
 
-        if not top_project_vehicle.empty:
-            lines.append(
-                f"Ən çox maşın görünən layihə: "
-                f"{top_project_vehicle.index[0]} ({top_project_vehicle.iloc[0]} maşın)"
-            )
+    lines.append("")
+    lines.append("✅ Tövsiyə")
 
-    lines.append(
-        "Yekun fikir: Bu nəticələr normadan artıq sərfiyyat və sızma hallarının "
-        "eyni intervalda düşdüyü riskli halları prioritetləşdirmək üçün istifadə oluna bilər."
-    )
+    lines.append("- Risk score-u yüksək olan maşınlar üzrə ayrıca yoxlama aparılsın.")
+    lines.append("- Sızma hadisəsi ilə normadan artıq sərfiyyat eyni intervala düşürsə, həmin hal prioritet araşdırılsın.")
+    lines.append("- Layihə və point üzrə təkrarlanan risklər ayrıca izlənilsin.")
+    lines.append("- Çox yüksək L/100km və L/saat dəyərlərində sensor, km datası və faktiki iş rejimi ayrıca yoxlanılsın.")
 
     return "\n".join(lines)
 
+# =========================
+# SIDEBAR
+# =========================
 
 st.sidebar.header("Filterlər")
 
@@ -118,35 +303,20 @@ dataset_choice = st.sidebar.selectbox(
 if dataset_choice == "Overuse + Leak":
     df = df_overuse_with_leak.copy()
     title = "Overuse + Leak: Normadan artıq sərfiyyat + sızma"
-
 elif dataset_choice == "Leak Events":
     df = df_decrease_10plus.copy()
     title = "Leak Events: DUT sızma hadisələri"
-
 else:
     df = df_analysis.copy()
     title = "Atlas + GPS Analysis: Yanacaq və normativ analizi"
 
-st.subheader(title)
+df = prepare_dates(df)
+date_col = get_date_col(df)
+plate_col = get_plate_col(df)
 
-date_col = None
-
-if "fuel_datetime" in df.columns:
-    date_col = "fuel_datetime"
-elif "datetime" in df.columns:
-    date_col = "datetime"
-elif "first_leak_datetime" in df.columns:
-    date_col = "first_leak_datetime"
-
-for col in [
-    "fuel_datetime",
-    "next_fuel_datetime",
-    "first_leak_datetime",
-    "last_leak_datetime",
-    "datetime"
-]:
-    if col in df.columns:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
+# =========================
+# FILTERS
+# =========================
 
 if date_col and df[date_col].notna().any():
     min_date = df[date_col].min().date()
@@ -163,15 +333,6 @@ if date_col and df[date_col].notna().any():
             (df[date_col].dt.date >= start_date) &
             (df[date_col].dt.date <= end_date)
         ]
-
-plate_col = None
-
-if "plate" in df.columns:
-    plate_col = "plate"
-elif "plate_clean" in df.columns:
-    plate_col = "plate_clean"
-elif "Grouping" in df.columns:
-    plate_col = "Grouping"
 
 if plate_col:
     selected_plates = st.sidebar.multiselect(
@@ -209,8 +370,17 @@ if "point" in df.columns:
     if selected_points:
         df = df[df["point"].astype(str).isin(selected_points)]
 
+# =========================
+# HEADER
+# =========================
 
-col1, col2, col3, col4 = st.columns(4)
+st.markdown(f"### {title}")
+
+# =========================
+# KPI CARDS
+# =========================
+
+col1, col2, col3, col4, col5 = st.columns(5)
 
 col1.metric("Sətir sayı", len(df))
 
@@ -220,53 +390,83 @@ else:
     col2.metric("Maşın sayı", "-")
 
 if "volume" in df.columns:
-    col3.metric("Ümumi yanacaq, litr", round(df["volume"].sum(), 2))
+    col3.metric("Ümumi yanacaq", f"{df['volume'].sum():,.0f} L")
 else:
-    col3.metric("Ümumi yanacaq, litr", "-")
+    col3.metric("Ümumi yanacaq", "-")
 
 if "total_leak_liters" in df.columns:
-    col4.metric("Ümumi sızma, litr", round(df["total_leak_liters"].sum(), 2))
+    col4.metric("Ümumi sızma", f"{df['total_leak_liters'].sum():,.0f} L")
 elif "delta" in df.columns:
-    col4.metric("Ümumi azalma, litr", round(df["delta"].abs().sum(), 2))
+    col4.metric("Ümumi azalma", f"{df['delta'].abs().sum():,.0f} L")
 else:
-    col4.metric("Ümumi sızma, litr", "-")
+    col4.metric("Ümumi sızma", "-")
+
+if "motohour_analysis" in df.columns or "km_analysis" in df.columns:
+    col5.metric("Normadan artıq hallar", int(get_overuse_mask(df).sum()))
+else:
+    col5.metric("Normadan artıq hallar", "-")
 
 st.divider()
 
-st.subheader("AI Summary")
+# =========================
+# TOP ATTENTION VEHICLES
+# =========================
 
-if st.button("Summary yarat"):
-    summary_text = generate_data_summary(df, dataset_choice, plate_col)
-    st.text_area("Avtomatik analiz", summary_text, height=320)
+st.markdown("## Top diqqət edilməli maşınlar")
+
+attention_table = build_attention_table(df, plate_col)
+
+if not attention_table.empty:
+    st.markdown(
+        '<div class="risk-box">Bu siyahı sızma həcmi, sızma sayı, normadan artıq sərfiyyat və faktiki sərf dəyərlərinə əsasən hesablanır.</div>',
+        unsafe_allow_html=True
+    )
+
+    st.dataframe(attention_table, width="stretch")
+
+    fig = px.bar(
+        attention_table,
+        x=plate_col,
+        y="risk_score",
+        color="risk_score",
+        title="Top risk score üzrə maşınlar"
+    )
+    st.plotly_chart(fig, width="stretch")
+else:
+    st.info("Bu dataset üçün top risk cədvəli formalaşdırmaq mümkün olmadı.")
 
 st.divider()
 
-st.subheader("Dataset cədvəli")
-st.dataframe(df, width="stretch")
+# =========================
+# AI SUMMARY
+# =========================
+
+st.markdown("## AI Summary")
+
+if st.button("Risk, trend və məsləhət yarat"):
+    summary_text = generate_ai_summary(df, dataset_choice, plate_col)
+    st.markdown(f'<div class="ai-box">{summary_text}</div>', unsafe_allow_html=True)
 
 st.divider()
 
+# =========================
+# DATA TABLE
+# =========================
 
-def get_overuse_mask(data):
-    mask = pd.Series(False, index=data.index)
+with st.expander("Dataset cədvəlini göstər", expanded=False):
+    st.dataframe(df, width="stretch")
 
-    if "motohour_analysis" in data.columns:
-        mask = mask | data["motohour_analysis"].astype(str).str.contains(
-            "yüksək|limitindən yüksək", case=False, na=False
-        )
+st.divider()
 
-    if "km_analysis" in data.columns:
-        mask = mask | data["km_analysis"].astype(str).str.contains(
-            "yüksək|limitdən yüksək", case=False, na=False
-        )
-
-    return mask
-
+# =========================
+# ANALYTICS
+# =========================
 
 leak_date_col = "first_leak_datetime" if "first_leak_datetime" in df.columns else date_col
 
+# 1
 if leak_date_col and "total_leak_liters" in df.columns:
-    st.subheader("1. Tarix üzrə sızma miqdarları")
+    st.markdown("## 1. Tarix üzrə sızma miqdarları")
 
     daily_leak = (
         df.assign(date=df[leak_date_col].dt.date)
@@ -275,28 +475,40 @@ if leak_date_col and "total_leak_liters" in df.columns:
         .sort_values("date")
     )
 
-    st.bar_chart(daily_leak.set_index("date")["total_leak_liters"])
+    fig = px.bar(
+        daily_leak,
+        x="date",
+        y="total_leak_liters",
+        title="Tarix üzrə sızma miqdarı"
+    )
+    st.plotly_chart(fig, width="stretch")
     st.dataframe(daily_leak, width="stretch")
 
 elif date_col and "delta" in df.columns:
-    st.subheader("1. Tarix üzrə sızma / azalma miqdarları")
+    st.markdown("## 1. Tarix üzrə DUT azalma miqdarları")
 
-    df_tmp = df.copy()
-    df_tmp["decrease_liters"] = df_tmp["delta"].abs()
+    temp = df.copy()
+    temp["decrease_liters"] = temp["delta"].abs()
 
-    daily_leak = (
-        df_tmp.assign(date=df_tmp[date_col].dt.date)
+    daily_decrease = (
+        temp.assign(date=temp[date_col].dt.date)
         .groupby("date", as_index=False)
         .agg(total_decrease_liters=("decrease_liters", "sum"))
         .sort_values("date")
     )
 
-    st.bar_chart(daily_leak.set_index("date")["total_decrease_liters"])
-    st.dataframe(daily_leak, width="stretch")
+    fig = px.bar(
+        daily_decrease,
+        x="date",
+        y="total_decrease_liters",
+        title="Tarix üzrə DUT azalma miqdarı"
+    )
+    st.plotly_chart(fig, width="stretch")
+    st.dataframe(daily_decrease, width="stretch")
 
-
+# 2
 if leak_date_col and plate_col and "total_leak_liters" in df.columns:
-    st.subheader("2. Tarix üzrə sızma olan maşın sayı")
+    st.markdown("## 2. Tarix üzrə sızma olan maşın sayı")
 
     daily_vehicle_count = (
         df.assign(date=df[leak_date_col].dt.date)
@@ -305,25 +517,19 @@ if leak_date_col and plate_col and "total_leak_liters" in df.columns:
         .sort_values("date")
     )
 
-    st.bar_chart(daily_vehicle_count.set_index("date")["vehicle_count"])
-    st.dataframe(daily_vehicle_count, width="stretch")
-
-elif date_col and plate_col and "delta" in df.columns:
-    st.subheader("2. Tarix üzrə sızma / azalma olan maşın sayı")
-
-    daily_vehicle_count = (
-        df.assign(date=df[date_col].dt.date)
-        .groupby("date", as_index=False)
-        .agg(vehicle_count=(plate_col, "nunique"))
-        .sort_values("date")
+    fig = px.line(
+        daily_vehicle_count,
+        x="date",
+        y="vehicle_count",
+        markers=True,
+        title="Tarix üzrə sızma olan maşın sayı"
     )
-
-    st.bar_chart(daily_vehicle_count.set_index("date")["vehicle_count"])
+    st.plotly_chart(fig, width="stretch")
     st.dataframe(daily_vehicle_count, width="stretch")
 
-
+# 3
 if plate_col and "total_leak_liters" in df.columns:
-    st.subheader("3. Maşın üzrə toplam sızma litri və hadisə sayı")
+    st.markdown("## 3. Maşın üzrə toplam sızma litri və hadisə sayı")
 
     vehicle_leak = (
         df.groupby(plate_col, as_index=False)
@@ -334,30 +540,44 @@ if plate_col and "total_leak_liters" in df.columns:
         .sort_values("total_leak_liters", ascending=False)
     )
 
-    st.bar_chart(vehicle_leak.set_index(plate_col)["total_leak_liters"])
+    fig = px.bar(
+        vehicle_leak.head(20),
+        x=plate_col,
+        y="total_leak_liters",
+        color="leak_event_count",
+        title="Top maşınlar üzrə sızma litri"
+    )
+    st.plotly_chart(fig, width="stretch")
     st.dataframe(vehicle_leak, width="stretch")
 
 elif plate_col and "delta" in df.columns:
-    st.subheader("3. Maşın üzrə toplam sızma / azalma litri və hadisə sayı")
+    st.markdown("## 3. Maşın üzrə toplam DUT azalma")
 
-    df_tmp = df.copy()
-    df_tmp["decrease_liters"] = df_tmp["delta"].abs()
+    temp = df.copy()
+    temp["decrease_liters"] = temp["delta"].abs()
 
-    vehicle_leak = (
-        df_tmp.groupby(plate_col, as_index=False)
+    vehicle_decrease = (
+        temp.groupby(plate_col, as_index=False)
         .agg(
             total_decrease_liters=("decrease_liters", "sum"),
-            leak_event_count=("delta", "count")
+            event_count=("delta", "count")
         )
         .sort_values("total_decrease_liters", ascending=False)
     )
 
-    st.bar_chart(vehicle_leak.set_index(plate_col)["total_decrease_liters"])
-    st.dataframe(vehicle_leak, width="stretch")
+    fig = px.bar(
+        vehicle_decrease.head(20),
+        x=plate_col,
+        y="total_decrease_liters",
+        color="event_count",
+        title="Top maşınlar üzrə DUT azalma"
+    )
+    st.plotly_chart(fig, width="stretch")
+    st.dataframe(vehicle_decrease, width="stretch")
 
-
+# 4
 if plate_col and ("motohour_analysis" in df.columns or "km_analysis" in df.columns):
-    st.subheader("4. Maşın üzrə normadan artıq sərfiyyat sayı")
+    st.markdown("## 4. Maşın üzrə normadan artıq sərfiyyat sayı")
 
     risky_df = df[get_overuse_mask(df)].copy()
 
@@ -368,12 +588,18 @@ if plate_col and ("motohour_analysis" in df.columns or "km_analysis" in df.colum
         .sort_values("overuse_count", ascending=False)
     )
 
-    st.bar_chart(risky_vehicle.set_index(plate_col)["overuse_count"])
+    fig = px.bar(
+        risky_vehicle.head(20),
+        x=plate_col,
+        y="overuse_count",
+        title="Top maşınlar üzrə normadan artıq sərfiyyat sayı"
+    )
+    st.plotly_chart(fig, width="stretch")
     st.dataframe(risky_vehicle, width="stretch")
 
-
+# 5
 if "equipment_type" in df.columns and ("motohour_analysis" in df.columns or "km_analysis" in df.columns):
-    st.subheader("5. Equipment type üzrə normadan artıq hallar")
+    st.markdown("## 5. Equipment type üzrə normadan artıq hallar")
 
     risky_equipment = (
         df[get_overuse_mask(df)]
@@ -383,14 +609,21 @@ if "equipment_type" in df.columns and ("motohour_analysis" in df.columns or "km_
         .sort_values("risk_count", ascending=False)
     )
 
-    st.bar_chart(risky_equipment.set_index("equipment_type")["risk_count"])
+    fig = px.pie(
+        risky_equipment,
+        names="equipment_type",
+        values="risk_count",
+        title="Equipment type üzrə risk bölgüsü",
+        hole=0.35
+    )
+    st.plotly_chart(fig, width="stretch")
     st.dataframe(risky_equipment, width="stretch")
 
-
+# 6
 if "actual_lph" in df.columns and "normal_lph" in df.columns:
-    st.subheader("6. Motosaat üzrə actual_lph vs normal_lph")
+    st.markdown("## 6. Motosaat üzrə actual_lph vs normal_lph")
 
-    compare_lph_cols = [
+    cols = [
         c for c in [
             plate_col,
             "equipment_type",
@@ -407,14 +640,26 @@ if "actual_lph" in df.columns and "normal_lph" in df.columns:
         if c in df.columns and c is not None
     ]
 
-    compare_lph = df[compare_lph_cols].dropna(subset=["actual_lph"])
+    compare_lph = df[cols].dropna(subset=["actual_lph"])
+
+    if not compare_lph.empty:
+        fig = px.scatter(
+            compare_lph,
+            x="normal_lph",
+            y="actual_lph",
+            color="motohour_analysis" if "motohour_analysis" in compare_lph.columns else None,
+            hover_data=cols,
+            title="Actual LPH vs Normal LPH"
+        )
+        st.plotly_chart(fig, width="stretch")
+
     st.dataframe(compare_lph.sort_values("actual_lph", ascending=False), width="stretch")
 
-
+# 7
 if "actual_l_100km" in df.columns and "flat_l_100km" in df.columns:
-    st.subheader("7. Km üzrə actual_l_100km vs flat/mountain normativ")
+    st.markdown("## 7. Km üzrə actual_l_100km vs flat/mountain normativ")
 
-    compare_km_cols = [
+    cols = [
         c for c in [
             plate_col,
             "equipment_type",
@@ -431,12 +676,24 @@ if "actual_l_100km" in df.columns and "flat_l_100km" in df.columns:
         if c in df.columns and c is not None
     ]
 
-    compare_km = df[compare_km_cols].dropna(subset=["actual_l_100km"])
+    compare_km = df[cols].dropna(subset=["actual_l_100km"])
+
+    if not compare_km.empty:
+        fig = px.scatter(
+            compare_km,
+            x="flat_l_100km",
+            y="actual_l_100km",
+            color="km_analysis" if "km_analysis" in compare_km.columns else None,
+            hover_data=cols,
+            title="Actual L/100km vs Flat Norm"
+        )
+        st.plotly_chart(fig, width="stretch")
+
     st.dataframe(compare_km.sort_values("actual_l_100km", ascending=False), width="stretch")
 
-
+# 8
 if "total_leak_liters" in df.columns:
-    st.subheader("8. Overuse + Leak eyni intervalda olan riskli hallar")
+    st.markdown("## 8. Overuse + Leak eyni intervalda olan riskli hallar")
 
     risk_cols = [
         c for c in [
@@ -468,9 +725,9 @@ if "total_leak_liters" in df.columns:
 
     st.dataframe(risky_table[risk_cols], width="stretch")
 
-
+# Project pie
 if "project" in df.columns:
-    st.subheader("9. Layihə üzrə bölgü")
+    st.markdown("## Layihə üzrə risk bölgüsü")
 
     metric_choice = st.selectbox(
         "Project qrafiki üçün ölçü seç",
@@ -484,36 +741,35 @@ if "project" in df.columns:
 
     temp = df.copy()
 
-    if metric_choice == "Sətir sayı":
-        project_summary = temp.groupby("project", as_index=False).size().rename(columns={"size": "value"})
-        title = "Project üzrə sətir sayı"
-
-    elif metric_choice == "Unikal maşın sayı" and plate_col:
+    if metric_choice == "Unikal maşın sayı" and plate_col:
         project_summary = temp.groupby("project", as_index=False).agg(value=(plate_col, "nunique"))
-        title = "Project üzrə unikal maşın sayı"
-
+        title = "Layihə üzrə unikal maşın sayı"
     elif metric_choice == "Ümumi sızma litri" and "total_leak_liters" in temp.columns:
         project_summary = temp.groupby("project", as_index=False).agg(value=("total_leak_liters", "sum"))
-        title = "Project üzrə ümumi sızma litri"
-
+        title = "Layihə üzrə ümumi sızma litri"
     elif metric_choice == "Normadan artıq hallar":
         temp = temp[get_overuse_mask(temp)]
         project_summary = temp.groupby("project", as_index=False).size().rename(columns={"size": "value"})
-        title = "Project üzrə normadan artıq hallar"
-
+        title = "Layihə üzrə normadan artıq hallar"
     else:
         project_summary = temp.groupby("project", as_index=False).size().rename(columns={"size": "value"})
-        title = "Project üzrə bölgü"
+        title = "Layihə üzrə sətir sayı"
 
     project_summary = project_summary.sort_values("value", ascending=False)
 
-    fig = px.pie(project_summary, names="project", values="value", title=title, hole=0.35)
+    fig = px.pie(
+        project_summary,
+        names="project",
+        values="value",
+        title=title,
+        hole=0.35
+    )
     st.plotly_chart(fig, width="stretch")
     st.dataframe(project_summary, width="stretch")
 
-
+# Point pie
 if "point" in df.columns:
-    st.subheader("10. Point üzrə bölgü")
+    st.markdown("## Point üzrə risk bölgüsü")
 
     point_metric = st.selectbox(
         "Point qrafiki üçün ölçü seç",
@@ -528,59 +784,31 @@ if "point" in df.columns:
 
     temp = df.copy()
 
-    if point_metric == "Sətir sayı":
-        point_summary = temp.groupby("point", as_index=False).size().rename(columns={"size": "value"})
-        title = "Point üzrə sətir sayı"
-
-    elif point_metric == "Unikal maşın sayı" and plate_col:
+    if point_metric == "Unikal maşın sayı" and plate_col:
         point_summary = temp.groupby("point", as_index=False).agg(value=(plate_col, "nunique"))
         title = "Point üzrə unikal maşın sayı"
-
     elif point_metric == "Ümumi yanacaq litri" and "volume" in temp.columns:
         point_summary = temp.groupby("point", as_index=False).agg(value=("volume", "sum"))
         title = "Point üzrə ümumi yanacaq litri"
-
     elif point_metric == "Ümumi sızma litri" and "total_leak_liters" in temp.columns:
         point_summary = temp.groupby("point", as_index=False).agg(value=("total_leak_liters", "sum"))
         title = "Point üzrə ümumi sızma litri"
-
     elif point_metric == "Normadan artıq hallar":
         temp = temp[get_overuse_mask(temp)]
         point_summary = temp.groupby("point", as_index=False).size().rename(columns={"size": "value"})
         title = "Point üzrə normadan artıq hallar"
-
     else:
         point_summary = temp.groupby("point", as_index=False).size().rename(columns={"size": "value"})
-        title = "Point üzrə bölgü"
+        title = "Point üzrə sətir sayı"
 
     point_summary = point_summary.sort_values("value", ascending=False)
 
-    fig = px.pie(point_summary, names="point", values="value", title=title, hole=0.35)
+    fig = px.pie(
+        point_summary,
+        names="point",
+        values="value",
+        title=title,
+        hole=0.35
+    )
     st.plotly_chart(fig, width="stretch")
     st.dataframe(point_summary, width="stretch")
-
-
-if date_col and "project" in df.columns and plate_col:
-    st.subheader("11. Tarix və layihə üzrə maşın sayı")
-
-    temp = df.copy()
-    temp["date"] = temp[date_col].dt.date
-
-    project_daily = (
-        temp.groupby(["date", "project"], as_index=False)
-        .agg(vehicle_count=(plate_col, "nunique"))
-        .sort_values(["date", "vehicle_count"], ascending=[True, False])
-    )
-
-    st.dataframe(project_daily, width="stretch")
-
-    fig = px.bar(
-        project_daily,
-        x="date",
-        y="vehicle_count",
-        color="project",
-        title="Tarix üzrə layihələrdə maşın sayı",
-        barmode="stack"
-    )
-
-    st.plotly_chart(fig, width="stretch")
